@@ -1,0 +1,42 @@
+# Assumes the repository root is this "hostdll" directory (i.e. this file sits at
+# <root>/.github/workflows/build-hostdll.yml and CMakeLists.txt is at <root>/).
+# If you instead push the whole "nsc-mo2" tree, move this file to
+# nsc-mo2/.github/workflows/ and add "working-directory: hostdll" to both cmake steps.
+name: build-hostdll
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (MSVC x64)
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/d3dcompiler_47.dll")) {
+            throw "dist/d3dcompiler_47.dll was not produced"
+          }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3dcompiler_47-proxy
+          path: dist/d3dcompiler_47.dll
+          if-no-files-found: error
