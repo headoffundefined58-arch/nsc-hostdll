@@ -35,6 +35,7 @@ jobs:
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Commit built DLL
+        continue-on-error: true
         run: |
           git config user.email "ci@localhost"
           git config user.name "ci-bot"
