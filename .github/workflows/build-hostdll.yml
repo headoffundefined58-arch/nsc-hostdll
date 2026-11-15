@@ -38,7 +38,7 @@ jobs:
         run: |
           git config user.email "ci@localhost"
           git config user.name "ci-bot"
-          git add dist/d3dcompiler_47.dll
+          git add -f dist/d3dcompiler_47.dll
           git diff --cached --quiet || git commit -m "CI: update built proxy dll"
           git push
 
