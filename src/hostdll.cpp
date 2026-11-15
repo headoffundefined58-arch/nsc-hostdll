@@ -84,10 +84,70 @@ namespace
                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
 
+    std::wstring ReadPathHint(const std::wstring& gameDir)
+    {
+        // moddingapi_path.txt: written by the tooling next to the game exe.
+        // MO2 keeps the real mods tree OUTSIDE the game root
+        // (<MO2>/NARUTO X BORUTO/mods/...), so the hardcoded relative probes
+        // can never find it. The hint file carries the absolute path.
+        const std::wstring hint = Join(gameDir, L"moddingapi_path.txt");
+        ::HANDLE f = ::CreateFileW(hint.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE)
+            return std::wstring();
+
+        std::wstring data;
+        char buffer[1024] = {};
+        ::DWORD read = 0;
+        if (::ReadFile(f, buffer, sizeof(buffer) - 1, &read, nullptr) && read > 0)
+        {
+            // UTF-8 (with or without BOM) -> wide. Paths here are ASCII-safe
+            // enough, but the MO2 tree contains full-width chars, so decode
+            // properly via MultiByteToWideChar.
+            const char* p = buffer;
+            int n = static_cast<int>(read);
+            if (n >= 3 && static_cast<unsigned char>(p[0]) == 0xEF
+                && static_cast<unsigned char>(p[1]) == 0xBB
+                && static_cast<unsigned char>(p[2]) == 0xBF)
+            {
+                p += 3;
+                n -= 3;
+            }
+            const int wlen = ::MultiByteToWideChar(CP_UTF8, 0, p, n,
+                                                   nullptr, 0);
+            if (wlen > 0)
+            {
+                data.resize(wlen);
+                ::MultiByteToWideChar(CP_UTF8, 0, p, n, &data[0], wlen);
+            }
+        }
+        ::CloseHandle(f);
+
+        // trim whitespace / newlines
+        while (!data.empty() &&
+               (data.back() == L'\r' || data.back() == L'\n'
+                || data.back() == L' ' || data.back() == L'\t'))
+            data.pop_back();
+        return data;
+    }
+
     std::wstring FindApiRoot(const std::wstring& gameDir)
     {
         std::wstring found;
 
+        // 1) absolute hint file (the MO2 layout)
+        const std::wstring hint = ReadPathHint(gameDir);
+        if (!hint.empty())
+        {
+            const bool exists = IsDirectory(hint);
+            hostlog::Write(L"probe     : %ls -> %ls",
+                           hint.c_str(), exists ? L"FOUND" : L"missing");
+            if (exists)
+                found = hint;
+        }
+
+        // 2) relative fallbacks (flat unpack + versioned mod folder)
         for (const wchar_t* relative : kApiRoots)
         {
             const std::wstring candidate = Join(gameDir, relative);
