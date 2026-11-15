@@ -45,12 +45,12 @@ jobs:
         run: |
           $sha = ""
           try { $sha = gh api "repos/$env:GITHUB_REPOSITORY/contents/dist/d3dcompiler_47.dll?ref=main" --jq '.sha' } catch { $sha = "" }
+          if ($LASTEXITCODE -ne 0) { $sha = "" }
           $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("dist/d3dcompiler_47.dll"))
-          if ($sha) {
-            gh api --method PUT "repos/$env:GITHUB_REPOSITORY/contents/dist/d3dcompiler_47.dll" -f message="CI: publish built dll [skip ci]" -f content="$b64" -f sha="$sha" -f branch="main"
-          } else {
-            gh api --method PUT "repos/$env:GITHUB_REPOSITORY/contents/dist/d3dcompiler_47.dll" -f message="CI: publish built dll [skip ci]" -f content="$b64" -f branch="main"
-          }
+          $body = @{ message = "CI: publish built dll [skip ci]"; content = $b64; branch = "main" }
+          if ($sha) { $body.sha = $sha }
+          $body | ConvertTo-Json | Set-Content -Encoding utf8 payload.json
+          gh api --method PUT "repos/$env:GITHUB_REPOSITORY/contents/dist/d3dcompiler_47.dll" --input payload.json
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
