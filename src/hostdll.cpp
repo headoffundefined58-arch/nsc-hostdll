@@ -318,6 +318,20 @@ namespace
         hostlog::Write(L"loaded    : base=0x%p", static_cast<void*>(plugin));
         g_pluginModule = plugin;
 
+        // CPKLoader gates every diagnostic on a single byte at RVA 0x12DA8
+        // ("cmp byte ptr [rip+..], 0 / je skip" in front of each cout). It is only
+        // set when the plugin decided the game is a debug build, which never happens
+        // here -- so force it on and let the plugin talk. Its output goes to stdout.
+        {
+            BYTE* verboseFlag = reinterpret_cast<BYTE*>(plugin) + 0x12DA8;
+            DWORD flagProtect = 0;
+            if (::VirtualProtect(verboseFlag, 1, PAGE_READWRITE, &flagProtect))
+            {
+                *verboseFlag = 1;
+                ::VirtualProtect(verboseFlag, 1, flagProtect, &flagProtect);
+            }
+        }
+
         const auto initializePlugin = reinterpret_cast<InitializePluginFn>(
             ::GetProcAddress(plugin, "InitializePlugin"));
         if (initializePlugin == nullptr)
