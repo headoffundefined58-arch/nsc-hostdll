@@ -330,11 +330,21 @@ namespace
         void* moduleBase = static_cast<void*>(::GetModuleHandleW(nullptr));
         g_deprecatedArgs.clear();
 
-        hostlog::Write(L"calling   : InitializePlugin(moduleBase=0x%p, deprecated=0x%p)",
-                       moduleBase, static_cast<void*>(&g_deprecatedArgs));
+        // CPKLoader derives its notion of "the game module" as (argument - 0xC00):
+        //     lea rax, [rcx - 0xC00]  /  mov [global], rax
+        // It then pattern-scans [that, that + SizeOfImage) and forms every hook
+        // address as that + <hardcoded RVA>. Handing it the plain image base makes
+        // the scan start 0xC00 bytes *before* the mapping, which faults on the very
+        // first byte (CPKLoader.dll+0x862d). Passing base + 0xC00 yields exactly the
+        // image base once the plugin subtracts its constant.
+        void* pluginModuleArg = static_cast<void*>(
+            reinterpret_cast<BYTE*>(moduleBase) + 0xC00);
+
+        hostlog::Write(L"calling   : InitializePlugin(moduleBase=0x%p [image=0x%p], deprecated=0x%p)",
+                       pluginModuleArg, moduleBase, static_cast<void*>(&g_deprecatedArgs));
 
         const ULONGLONG started = ::GetTickCount64();
-        initializePlugin(moduleBase, &g_deprecatedArgs);
+        initializePlugin(pluginModuleArg, &g_deprecatedArgs);
 
         hostlog::Write(L"RESULT: InitializePlugin returned after %llu ms",
                        static_cast<unsigned long long>(::GetTickCount64() - started));
@@ -351,10 +361,10 @@ namespace
         }
 
         hostlog::Write(L"calling   : InitializeHooks(moduleBase=0x%p, hookPlugin=0x%p)",
-                       moduleBase, reinterpret_cast<void*>(&HookPluginImpl));
+                       pluginModuleArg, reinterpret_cast<void*>(&HookPluginImpl));
 
         const ULONGLONG hookStarted = ::GetTickCount64();
-        initializeHooks(moduleBase, reinterpret_cast<void*>(&HookPluginImpl));
+        initializeHooks(pluginModuleArg, reinterpret_cast<void*>(&HookPluginImpl));
 
         hostlog::Write(L"RESULT: InitializeHooks returned after %llu ms, %llu hook(s) installed",
                        static_cast<unsigned long long>(::GetTickCount64() - hookStarted),
