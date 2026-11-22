@@ -447,6 +447,132 @@ DWORD WINAPI HostdllWorker(LPVOID reserved)
     return 0;
 }
 
+// ---- entry-point bootstrap --------------------------------------------------
+//
+// The game mounts its CPKs very early. A worker thread spawned from DllMain is
+// scheduled AFTER the game's main thread has already raced through its CPK mount
+// routine, so the plugin hook was installed too late and the game never called
+// the hooked function again (hostdll.log showed "Hook ... was enabled", yet the
+// replacement never ran and no modmanager CPK was ever registered).
+//
+// Fix: hijack the EXE entry point from DllMain, which executes BEFORE the entry
+// point is reached. The patched entry jumps into a raw machine-code stub that
+//   (1) loads the plugin and installs every hook,
+//   (2) restores the original entry bytes,
+//   (3) jumps into the real entry point.
+// The stub runs on the main thread with the loader lock already released, so
+// LoadLibraryW inside the bootstrap is legal. The game then starts normally with
+// the CPK detour already in place, i.e. before the very first CPK mount.
+namespace
+{
+    BYTE* g_entryAddress = nullptr;
+    BYTE  g_entryOriginal[16] = {};
+    bool  g_entryPatched = false;
+    bool  g_entryFailed = false;
+
+    void __fastcall EntryPointBootstrap(void* /*unused*/)
+    {
+        // HostdllWorker guards RunHost with __try/__except and does all the
+        // logging; a failure there must never prevent the game from starting.
+        HostdllWorker(nullptr);
+
+        if (g_entryPatched)
+        {
+            DWORD oldProtect = 0;
+            if (::VirtualProtect(g_entryAddress, sizeof(g_entryOriginal),
+                                 PAGE_EXECUTE_READWRITE, &oldProtect))
+            {
+                ::memcpy(g_entryAddress, g_entryOriginal, sizeof(g_entryOriginal));
+                ::FlushInstructionCache(::GetCurrentProcess(), g_entryAddress,
+                                        sizeof(g_entryOriginal));
+                ::VirtualProtect(g_entryAddress, sizeof(g_entryOriginal),
+                                 oldProtect, &oldProtect);
+                hostlog::Write(L"bootstrap : entry point restored, handing control to the game");
+            }
+            else
+            {
+                hostlog::Write(L"bootstrap : FAILED to restore entry point protect, err=%lu",
+                               static_cast<unsigned long>(::GetLastError()));
+            }
+        }
+        else if (g_entryFailed)
+        {
+            hostlog::Write(L"bootstrap : entry patch never applied, plugin skipped");
+        }
+    }
+
+    // Raw stub executed in place of the entry point (no compiler prologue):
+    //   sub rsp,0x28                    ; shadow space; keeps rsp 16-aligned
+    //   movabs rax,EntryPointBootstrap
+    //   call rax
+    //   add rsp,0x28                    ; undo the call's push -> original entry rsp
+    //   jmp qword ptr [rip+0]           ; tail-jump into the real entry point
+    //   <8-byte absolute entry address>
+    // When the loader enters the entry point rsp%16 == 8; after sub 0x28 it is
+    // 16-aligned for the call, and add 0x28 hands the real entry the exact rsp
+    // state the Windows loader would have given it.
+    constexpr SIZE_T kStubSize = 4 + 10 + 3 + 4 + 6 + 8;   // 35 bytes
+    BYTE g_stubTemplate[kStubSize] = {
+        0x48, 0x83, 0xEC, 0x28,                                // sub rsp,0x28
+        0x48, 0xB8, 0,0,0,0, 0,0,0,0,                          // movabs rax, imm64
+        0x48, 0xFF, 0xD0,                                      // call rax
+        0x48, 0x83, 0xC4, 0x28,                                // add rsp,0x28
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,                    // jmp [rip+0]
+        0,0,0,0, 0,0,0,0,                                      // entry address
+    };
+
+    bool PatchEntryPointForBootstrap()
+    {
+        const HMODULE exe = ::GetModuleHandleW(nullptr);
+        if (exe == nullptr)
+            return false;
+
+        const BYTE* base = reinterpret_cast<const BYTE*>(exe);
+        const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+
+        const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+
+        const DWORD entryRva = nt->OptionalHeader.AddressOfEntryPoint;
+        if (entryRva == 0)
+            return false;
+
+        g_entryAddress = const_cast<BYTE*>(base) + entryRva;
+        ::memcpy(g_entryOriginal, g_entryAddress, sizeof(g_entryOriginal));
+
+        const void* bootstrap = reinterpret_cast<const void*>(&EntryPointBootstrap);
+        ::memcpy(g_stubTemplate + 6, &bootstrap, sizeof(bootstrap));
+        ::memcpy(g_stubTemplate + 27, &g_entryAddress, sizeof(g_entryAddress));
+
+        BYTE* stub = static_cast<BYTE*>(::VirtualAlloc(
+            nullptr, kStubSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (stub == nullptr)
+            return false;
+        ::memcpy(stub, g_stubTemplate, kStubSize);
+
+        BYTE jmp[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        ::memcpy(jmp + 6, &stub, sizeof(stub));
+
+        DWORD oldProtect = 0;
+        if (!::VirtualProtect(g_entryAddress, sizeof(g_entryOriginal),
+                              PAGE_EXECUTE_READWRITE, &oldProtect))
+            return false;
+
+        ::memcpy(g_entryAddress, jmp, sizeof(jmp));
+        ::FlushInstructionCache(::GetCurrentProcess(), g_entryAddress,
+                                sizeof(g_entryOriginal));
+        ::VirtualProtect(g_entryAddress, sizeof(g_entryOriginal), oldProtect, &oldProtect);
+
+        g_entryPatched = true;
+        return true;
+    }
+}
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
@@ -456,11 +582,11 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved
         g_selfModule = instance;
         ::DisableThreadLibraryCalls(instance);
 
-        // Only CreateThread() here: LoadLibrary() must not run under the loader
-        // lock, which is exactly what the worker thread avoids.
-        const HANDLE thread = ::CreateThread(nullptr, 0, &HostdllWorker, nullptr, 0, nullptr);
-        if (thread != nullptr)
-            ::CloseHandle(thread);
+        // Patch the entry point instead of spawning a worker thread. Everything
+        // that needs the loader lock (LoadLibrary of the plugin) runs later, from
+        // the stub on the main thread -- after loader init has completed.
+        if (!PatchEntryPointForBootstrap())
+            g_entryFailed = true;
     }
 
     return TRUE;
