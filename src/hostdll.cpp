@@ -403,7 +403,7 @@ DWORD WINAPI HostdllWorker(LPVOID reserved)
     {
         RunHost();
     }
-    __except (ReportHostException(::GetExceptionInformation()))
+    __except (ReportHostException(GetExceptionInformation()))
     {
     }
 
