@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,11 @@ namespace
     // Signature of CPKLoader!InitializePlugin. The plugin is called with the base
     // address of the running executable, exactly like the original ModdingAPI did.
     using InitializePluginFn = void(__stdcall*)(void* moduleBase, void* deprecatedVector);
+
+    // Signature of CPKLoader!InitializeHooks. The second argument is the host's hook
+    // API (ModdingAPI's HookFunctions::HookPlugin), which the plugin uses to replace
+    // the game's CPK-loading routine with its own.
+    using InitializeHooksFn = void(__stdcall*)(void* moduleBase, void* hookFunction);
 
     constexpr const wchar_t* kPluginRelativePath = L"mods\\base_game\\CPKLoader.dll";
     constexpr const wchar_t* kLogRelativePath    = L"moddingapi\\hostdll.log";
@@ -75,6 +81,96 @@ namespace
     {
         return !path.empty() &&
                ::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+
+    // ---- hook API handed to the plugin --------------------------------------
+    //
+    // CPKLoader does NOT install its detours by itself. It exports InitializeHooks
+    // and expects the host to pass a function with this exact contract:
+    //
+    //     bool (*)(void* toHook, void* ourFunct, int len)
+    //
+    // Without a real implementation the plugin parses its .cpk.info files, prints
+    // the priorities and returns -- so not a single CPK is ever mounted. That is
+    // precisely what the 22:28 run showed.
+    struct PluginHook
+    {
+        void* address;
+        void* originalBytes;
+        int length;
+    };
+
+    std::vector<PluginHook> g_pluginHooks;
+
+    // Equivalent of ModdingAPI's HookFunctions::HookPlugin (Hook(..., isPlugin=true)).
+    //
+    // 14-byte absolute jmp stub written over the target prologue:
+    //     FF 25 00 00 00 00        jmp qword ptr [rip+0]
+    //     <8-byte absolute target>
+    // The overwritten prologue is copied to a trampoline that ends with the same
+    // stub jumping back to (toHook + len), so the original code stays reachable and
+    // the plugin's detour can call through to it.
+    bool __cdecl HookPluginImpl(void* toHook, void* ourFunct, int len)
+    {
+        constexpr int kStubSize = 14;
+
+        if (toHook == nullptr || ourFunct == nullptr || len < kStubSize)
+        {
+            hostlog::Write(L"hook      : rejected (target=0x%p replacement=0x%p len=%d)",
+                           toHook, ourFunct, len);
+            return false;
+        }
+
+        const SIZE_T length = static_cast<SIZE_T>(len);
+
+        void* trampoline = ::VirtualAlloc(nullptr, length + kStubSize,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        void* original = ::VirtualAlloc(nullptr, length,
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (trampoline == nullptr || original == nullptr)
+        {
+            hostlog::Write(L"hook      : VirtualAlloc failed, GetLastError=%lu",
+                           static_cast<unsigned long>(::GetLastError()));
+            if (trampoline != nullptr)
+                ::VirtualFree(trampoline, 0, MEM_RELEASE);
+            if (original != nullptr)
+                ::VirtualFree(original, 0, MEM_RELEASE);
+            return false;
+        }
+
+        ::memcpy(original, toHook, length);
+
+        DWORD oldProtect = 0;
+        if (!::VirtualProtect(toHook, length, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            hostlog::Write(L"hook      : VirtualProtect failed, GetLastError=%lu",
+                           static_cast<unsigned long>(::GetLastError()));
+            return false;
+        }
+
+        BYTE stub[kStubSize] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+        // trampoline: [original prologue][jmp toHook+len]
+        const DWORD_PTR resume = reinterpret_cast<DWORD_PTR>(toHook) + static_cast<DWORD_PTR>(len);
+        ::memcpy(stub + 6, &resume, sizeof(resume));
+        ::memcpy(trampoline, toHook, length);
+        ::memcpy(static_cast<BYTE*>(trampoline) + len, stub, kStubSize);
+
+        // target: [jmp ourFunct][nop padding]
+        ::memcpy(stub + 6, &ourFunct, sizeof(ourFunct));
+        ::memcpy(toHook, stub, kStubSize);
+        for (int i = kStubSize; i < len; ++i)
+            static_cast<BYTE*>(toHook)[i] = 0x90;
+
+        ::VirtualProtect(toHook, length, oldProtect, &oldProtect);
+
+        PluginHook record = { toHook, original, len };
+        g_pluginHooks.push_back(record);
+
+        hostlog::Write(L"hook      : 0x%p -> 0x%p (len=%d, trampoline=0x%p)",
+                       toHook, ourFunct, len, trampoline);
+        return true;
     }
 
     bool IsDirectory(const std::wstring& path)
@@ -237,6 +333,27 @@ namespace
 
         hostlog::Write(L"RESULT: InitializePlugin returned after %llu ms",
                        static_cast<unsigned long long>(::GetTickCount64() - started));
+
+        // Second half of the plugin contract. InitializePlugin only registers the
+        // mods / cpk list; the actual detour of the game's CPK routine is installed
+        // here, through the hook function we hand over.
+        const auto initializeHooks = reinterpret_cast<InitializeHooksFn>(
+            ::GetProcAddress(plugin, "InitializeHooks"));
+        if (initializeHooks == nullptr)
+        {
+            hostlog::Write(L"RESULT: export InitializeHooks not found, plugin cannot mount anything");
+            return;
+        }
+
+        hostlog::Write(L"calling   : InitializeHooks(moduleBase=0x%p, hookPlugin=0x%p)",
+                       moduleBase, reinterpret_cast<void*>(&HookPluginImpl));
+
+        const ULONGLONG hookStarted = ::GetTickCount64();
+        initializeHooks(moduleBase, reinterpret_cast<void*>(&HookPluginImpl));
+
+        hostlog::Write(L"RESULT: InitializeHooks returned after %llu ms, %llu hook(s) installed",
+                       static_cast<unsigned long long>(::GetTickCount64() - hookStarted),
+                       static_cast<unsigned long long>(g_pluginHooks.size()));
     }
 }
 
