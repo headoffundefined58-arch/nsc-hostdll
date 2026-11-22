@@ -11,6 +11,7 @@
 namespace
 {
     HMODULE g_selfModule = nullptr;
+    HMODULE g_pluginModule = nullptr;
 
     // The plugin's InitializePlugin takes a second, "deprecated" std::vector<__int64>
     // argument by value. It is never read by the current CPKLoader build, so an
@@ -113,6 +114,9 @@ namespace
     bool __cdecl HookPluginImpl(void* toHook, void* ourFunct, int len)
     {
         constexpr int kStubSize = 14;
+
+        hostlog::Write(L"hook      : requested target=0x%p replacement=0x%p len=%d",
+                       toHook, ourFunct, len);
 
         if (toHook == nullptr || ourFunct == nullptr || len < kStubSize)
         {
@@ -312,6 +316,7 @@ namespace
         }
 
         hostlog::Write(L"loaded    : base=0x%p", static_cast<void*>(plugin));
+        g_pluginModule = plugin;
 
         const auto initializePlugin = reinterpret_cast<InitializePluginFn>(
             ::GetProcAddress(plugin, "InitializePlugin"));
@@ -369,8 +374,27 @@ DWORD WINAPI HostdllWorker(LPVOID reserved)
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        hostlog::Write(L"RESULT: unhandled exception 0x%08lX in host thread, plugin aborted",
-                       static_cast<unsigned long>(::GetExceptionCode()));
+        const EXCEPTION_POINTERS* info = ::GetExceptionInformation();
+        const void* address = nullptr;
+        DWORD code = 0;
+        if (info != nullptr && info->ExceptionRecord != nullptr)
+        {
+            address = info->ExceptionRecord->ExceptionAddress;
+            code = info->ExceptionRecord->ExceptionCode;
+        }
+
+        hostlog::Write(L"RESULT: exception 0x%08lX at 0x%p in host thread, plugin aborted",
+                       static_cast<unsigned long>(code), address);
+
+        if (g_pluginModule != nullptr && address != nullptr)
+        {
+            const DWORD_PTR base = reinterpret_cast<DWORD_PTR>(g_pluginModule);
+            const DWORD_PTR crash = reinterpret_cast<DWORD_PTR>(address);
+            hostlog::Write(L"RVA       : plugin base=0x%p fault=%s+0x%llx",
+                           reinterpret_cast<void*>(base),
+                           (crash >= base && crash < base + 0x800000) ? L"CPKLoader.dll" : L"other-module",
+                           static_cast<unsigned long long>(crash >= base ? crash - base : 0));
+        }
     }
 
     return 0;
