@@ -470,6 +470,8 @@ namespace
     bool  g_entryPatched = false;
     bool  g_entryFailed = false;
 
+    void DumpCpkHookState();
+
     void __fastcall EntryPointBootstrap(void* /*unused*/)
     {
         // HostdllWorker guards RunHost with __try/__except and does all the
@@ -498,6 +500,100 @@ namespace
         else if (g_entryFailed)
         {
             hostlog::Write(L"bootstrap : entry patch never applied, plugin skipped");
+        }
+
+        // Inside-process diagnostics. Cross-process ReadProcessMemory is blocked
+        // by this build (err 299), but we ARE in the process, so read the plugin's
+        // decisive state directly and put it in the log:
+        //   - the game's CPK-mount function must still carry the detour,
+        //   - the replacement's trampoline pointer must be set,
+        //   - the mod-CPK list must be non-empty, with readable path strings.
+        DumpCpkHookState();
+    }
+
+    void DumpCpkHookState()
+    {
+        HMODULE exe = ::GetModuleHandleW(nullptr);
+        if (exe == nullptr || g_pluginModule == nullptr)
+            return;
+
+        const BYTE* game = reinterpret_cast<const BYTE*>(exe);
+        const BYTE* plug = reinterpret_cast<const BYTE*>(g_pluginModule);
+
+        BYTE hookBytes[16] = {};
+        ::memcpy(hookBytes, game + 0xAD03A0, sizeof(hookBytes));
+        const bool detoured = ::memcmp(hookBytes, "\xFF\x25\x00\x00\x00\x00", 6) == 0;
+        hostlog::Write(L"state     : game+0xAD03A0 = %02X %02X %02X %02X %02X %02X %02X %02X detoured=%d",
+                       hookBytes[0], hookBytes[1], hookBytes[2], hookBytes[3],
+                       hookBytes[4], hookBytes[5], hookBytes[6], hookBytes[7],
+                       detoured ? 1 : 0);
+        if (detoured)
+        {
+            void* detour = nullptr;
+            ::memcpy(&detour, hookBytes + 6, sizeof(detour));
+            hostlog::Write(L"state     : detour target = 0x%p (plugin+0x%llx?)",
+                           detour,
+                           static_cast<unsigned long long>(
+                               reinterpret_cast<const BYTE*>(detour) - plug));
+        }
+
+        void* trampoline = nullptr;
+        ::memcpy(&trampoline, plug + 0x12DA0, sizeof(trampoline));
+        hostlog::Write(L"state     : replacement trampoline = 0x%p", trampoline);
+
+        BYTE* listBegin = nullptr;
+        BYTE* listEnd = nullptr;
+        ::memcpy(&listBegin, plug + 0x12DE0, sizeof(listBegin));
+        ::memcpy(&listEnd, plug + 0x12DE8, sizeof(listEnd));
+        const DWORD_PTR diff = reinterpret_cast<DWORD_PTR>(listEnd) -
+                               reinterpret_cast<DWORD_PTR>(listBegin);
+        hostlog::Write(L"state     : mod-CPK list begin=0x%p end=0x%p count=%lld",
+                       static_cast<void*>(listBegin), static_cast<void*>(listEnd),
+                       static_cast<long long>(diff / 32));
+
+        // Each record is a 32-byte std::string: [ptr-or-SSO buffer][size][capacity].
+        // SSO (< 16 chars) keeps the text inline; longer strings heap-allocate.
+        const long long count = static_cast<long long>(diff / 32);
+        for (long long i = 0; i < count && i < 8; ++i)
+        {
+            BYTE rec[32] = {};
+            ::memcpy(rec, listBegin + i * 32, sizeof(rec));
+            unsigned long long size = 0;
+            unsigned long long cap = 0;
+            ::memcpy(&size, rec + 16, sizeof(size));
+            ::memcpy(&cap, rec + 24, sizeof(cap));
+
+            const char* text = nullptr;
+            if (cap >= 16)
+            {
+                // heap-backed: first 8 bytes are the pointer. Read it live.
+                const char* heapPtr = nullptr;
+                ::memcpy(&heapPtr, rec, sizeof(heapPtr));
+                text = heapPtr;
+            }
+            else
+            {
+                text = reinterpret_cast<const char*>(rec);
+            }
+
+            if (text != nullptr && size > 0 && size < 512)
+            {
+                char path[512] = {};
+                ::memcpy(path, text, size < sizeof(path) - 1 ? size : sizeof(path) - 1);
+                int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+                if (wlen > 0 && wlen < 512)
+                {
+                    wchar_t wpath[512] = {};
+                    ::MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
+                    hostlog::Write(L"state     : cpk[%lld] size=%llu \"%ls\"",
+                                   i, size, wpath);
+                }
+            }
+            else
+            {
+                hostlog::Write(L"state     : cpk[%lld] size=%llu cap=%llu (unreadable)",
+                               i, size, cap);
+            }
         }
     }
 
