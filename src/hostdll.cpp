@@ -362,6 +362,37 @@ namespace
     }
 }
 
+// Exception filter: logs code + faulting address (and the offset into CPKLoader so
+// the crashing routine can be located offline) and lets the process continue.
+// GetExceptionInformation() is only legal in a filter expression, hence the filter.
+static int ReportHostException(const EXCEPTION_POINTERS* info)
+{
+    const void* address = nullptr;
+    DWORD code = 0;
+    if (info != nullptr && info->ExceptionRecord != nullptr)
+    {
+        address = info->ExceptionRecord->ExceptionAddress;
+        code = info->ExceptionRecord->ExceptionCode;
+    }
+
+    hostlog::Write(L"RESULT: exception 0x%08lX at 0x%p in host thread, plugin aborted",
+                   static_cast<unsigned long>(code), address);
+
+    const DWORD_PTR base = reinterpret_cast<DWORD_PTR>(g_pluginModule);
+    const DWORD_PTR crash = reinterpret_cast<DWORD_PTR>(address);
+    if (base != 0 && crash >= base && crash < base + 0x800000)
+    {
+        hostlog::Write(L"RVA       : CPKLoader.dll+0x%llx",
+                       static_cast<unsigned long long>(crash - base));
+    }
+    else if (crash != 0)
+    {
+        hostlog::Write(L"RVA       : outside CPKLoader.dll (base=0x%p)", reinterpret_cast<void*>(base));
+    }
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 DWORD WINAPI HostdllWorker(LPVOID reserved)
 {
     (void)reserved;
@@ -372,29 +403,8 @@ DWORD WINAPI HostdllWorker(LPVOID reserved)
     {
         RunHost();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except (ReportHostException(::GetExceptionInformation()))
     {
-        const EXCEPTION_POINTERS* info = ::GetExceptionInformation();
-        const void* address = nullptr;
-        DWORD code = 0;
-        if (info != nullptr && info->ExceptionRecord != nullptr)
-        {
-            address = info->ExceptionRecord->ExceptionAddress;
-            code = info->ExceptionRecord->ExceptionCode;
-        }
-
-        hostlog::Write(L"RESULT: exception 0x%08lX at 0x%p in host thread, plugin aborted",
-                       static_cast<unsigned long>(code), address);
-
-        if (g_pluginModule != nullptr && address != nullptr)
-        {
-            const DWORD_PTR base = reinterpret_cast<DWORD_PTR>(g_pluginModule);
-            const DWORD_PTR crash = reinterpret_cast<DWORD_PTR>(address);
-            hostlog::Write(L"RVA       : plugin base=0x%p fault=%s+0x%llx",
-                           reinterpret_cast<void*>(base),
-                           (crash >= base && crash < base + 0x800000) ? L"CPKLoader.dll" : L"other-module",
-                           static_cast<unsigned long long>(crash >= base ? crash - base : 0));
-        }
     }
 
     return 0;
