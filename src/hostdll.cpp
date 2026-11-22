@@ -363,6 +363,19 @@ namespace
         hostlog::Write(L"RESULT: InitializePlugin returned after %llu ms",
                        static_cast<unsigned long long>(::GetTickCount64() - started));
 
+        // Diagnostic: the plugin stores the module base it will pattern-scan at
+        // RVA 0x12DB8 and the range length at RVA 0x12DB0. If either is zero the
+        // scan loop never executes and the plugin silently decides "not found".
+        {
+            const BYTE* self = reinterpret_cast<const BYTE*>(plugin);
+            unsigned long long scanBase = 0;
+            unsigned long long scanSize = 0;
+            ::memcpy(&scanBase, self + 0x12DB8, sizeof(scanBase));
+            ::memcpy(&scanSize, self + 0x12DB0, sizeof(scanSize));
+            hostlog::Write(L"plugin    : scanBase=0x%llx scanSize=0x%llx (image=0x%p)",
+                           scanBase, scanSize, moduleBase);
+        }
+
         // Second half of the plugin contract. InitializePlugin only registers the
         // mods / cpk list; the actual detour of the game's CPK routine is installed
         // here, through the hook function we hand over.
